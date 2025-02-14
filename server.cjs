@@ -3,18 +3,20 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const nacl = require('tweetnacl');
-// Import bs58 as a default object so that its functions can be used properly.
 const bs58 = require('bs58').default;
 const { TextEncoder } = require('util');
+const jwt = require('jsonwebtoken'); // JWT session tokens
 require('dotenv').config();
 
 const app = express();
 
-// Add the JSON parsing middleware so that req.body is correctly populated
+// Constants for JWT
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const SESSION_DURATION = 10 * 60; 
+
+// JSON parsing middleware 
 app.use(express.json());
-// Remove the default cors() call to avoid sending "*" with credentials
-// app.use(cors());
-// Configure CORS middleware with proper options:
+// Configure CORS middleware:
 app.use(cors({
   origin: process.env.FRONTEND_URL,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -22,19 +24,14 @@ app.use(cors({
   credentials: true
 }));
 
-// Connect to MongoDB (make sure you set MONGO_URI in your .env file)
+// Connect to MongoDB 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
   .catch(err => console.error("MongoDB connection error:", err));
 
 /**
  * Define the Score schema and model.
- * This schema is used to store scores for any game.
- * 
- *
  */
-
-
 const scoreSchema = new mongoose.Schema({
   wallet: String,
   game: String,
@@ -58,7 +55,6 @@ const User = mongoose.model('User', userSchema);
 /**
  * Registration Endpoint
  * This endpoint allows a new user to register their wallet.
- * It accepts a wallet address, signature, message, and optionally a name.
  */
 app.post('/api/register', async (req, res) => {
   try {
@@ -103,22 +99,51 @@ app.post('/api/register', async (req, res) => {
 });
 
 /**
+ * Generate a JWT session token valid for a limited duration.
+ */
+app.post('/api/session', (req, res) => {
+  const { wallet, game } = req.body;
+  if (!wallet || !game) {
+    return res.status(400).json({ error: 'Missing wallet or game' });
+  }
+  const payload = { wallet, game };
+  const sessionToken = jwt.sign(payload, JWT_SECRET, { expiresIn: SESSION_DURATION });
+  res.json({ sessionToken });
+});
+
+/**
  * POST endpoint to log scores.
- * This endpoint accepts a wallet, game name, score, signature, and message.
- * It verifies the signature before saving the score.
  */
 app.post('/api/score', async (req, res) => {
   try {
-    const { wallet, game, score, authToken } = req.body;
-    // Validate the score format (and authToken if needed)
-    if (!wallet || !game || score === undefined) {
-      return res.status(400).json({ error: 'Invalid score format' });
+    const { wallet, game, score, sessionToken, clientSignature, signatureMessage } = req.body;
+    if (!wallet || !game || score === undefined || !sessionToken || !clientSignature || !signatureMessage) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // (Optionally) verify the authToken here if you implement token verification.
-    // For example: const valid = verifyAuthToken(authToken); if (!valid) { return res.status(401).json({ error: 'Invalid auth token' }); }
+    // Verify the session token
+    let sessionPayload;
+    try {
+      sessionPayload = jwt.verify(sessionToken, JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid or expired session token' });
+    }
+    
+    // Ensure the session token matches the request
+    if (sessionPayload.wallet !== wallet || sessionPayload.game !== game) {
+      return res.status(401).json({ error: 'Session token does not match the request' });
+    }
 
-    // Look up the registered user to obtain their name
+    // Verify the client's cryptographic signature
+    const messageBytes = new TextEncoder().encode(signatureMessage);
+    const sigBytes = bs58.decode(clientSignature);
+    const walletPublicKey = bs58.decode(wallet);
+    const isValidSignature = nacl.sign.detached.verify(messageBytes, sigBytes, walletPublicKey);
+    if (!isValidSignature) {
+      return res.status(401).json({ error: 'Invalid client signature' });
+    }
+
+    // Look up registered user to obtain their name (if registered)
     let userName = "";
     const user = await User.findOne({ wallet });
     if (user && user.name) {
@@ -138,7 +163,6 @@ app.post('/api/score', async (req, res) => {
 
 /**
  * GET endpoint to retrieve the best score for a specific user and game.
- * The query parameters "wallet" and "game" are required.
  */
 app.get('/api/bestscore', async (req, res) => {
   console.log("GET /api/bestscore called with query:", req.query);
@@ -158,13 +182,12 @@ app.get('/api/bestscore', async (req, res) => {
 
 /**
  * GET endpoint to retrieve leaderboard data for a specific game.
- * The query parameter "game" is required.
  */
 app.get('/api/leaderboard', async (req, res) => {
   const { game } = req.query;
   if (!game) return res.status(400).json({ error: 'Missing game query parameter' });
   try {
-    // Find the top 50 scores for the specified game, sorted descending by score
+    // Find the top 50 scores for the specified game, sorted descending by score.
     const scores = await Score.find({ game }).sort({ score: -1 }).limit(50);
     res.json({ scores });
   } catch (error) {
